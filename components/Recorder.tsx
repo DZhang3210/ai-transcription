@@ -3,7 +3,7 @@
 import { useMutation, useAction } from "convex/react";
 import { api } from "@/convex/_generated/api";
 import { Id } from "@/convex/_generated/dataModel";
-import { useRef, useState, useCallback } from "react";
+import { useRef, useState, useCallback, useEffect } from "react";
 import { Mic, Square, Loader2 } from "lucide-react";
 
 interface Segment {
@@ -28,11 +28,20 @@ export function Recorder({ folderId, onSaved, onCancel }: Props) {
 
   const startTimeRef = useRef<number>(0);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const recognitionRef = useRef<any>(null);
   // capture final segments inside the recognition closure
   const segmentsRef = useRef<Segment[]>([]);
+
+  // Stop mic on unmount (privacy: ensure no lingering microphone access)
+  useEffect(() => {
+    return () => {
+      recognitionRef.current?.stop();
+      streamRef.current?.getTracks().forEach((t) => t.stop());
+    };
+  }, []);
 
   const createRecording = useMutation(api.recordings.create);
   const generateUploadUrl = useMutation(api.recordings.generateUploadUrl);
@@ -40,14 +49,27 @@ export function Recorder({ folderId, onSaved, onCancel }: Props) {
   const generateMetadata = useAction(api.ai.generateMetadata);
 
   const startRecording = useCallback(async () => {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        noiseSuppression: true,
+        echoCancellation: true,
+        autoGainControl: true,
+      },
+    });
+    streamRef.current = stream;
     startTimeRef.current = Date.now();
     audioChunksRef.current = [];
     segmentsRef.current = [];
     setSegments([]);
     setLiveText("");
 
-    const mr = new MediaRecorder(stream);
+    // Use webm on desktop, fallback to supported format on mobile (e.g. iOS)
+    const mimeType = MediaRecorder.isTypeSupported("audio/webm")
+      ? "audio/webm"
+      : MediaRecorder.isTypeSupported("audio/mp4")
+      ? "audio/mp4"
+      : "";
+    const mr = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
     mediaRecorderRef.current = mr;
     mr.ondataavailable = (e) => audioChunksRef.current.push(e.data);
     mr.start(100);
@@ -55,11 +77,33 @@ export function Recorder({ folderId, onSaved, onCancel }: Props) {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const SpeechRecognitionAPI: any =
       (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+
+    if (!SpeechRecognitionAPI) {
+      // Speech recognition not available (e.g. some mobile browsers)
+      setPhase("recording");
+      return;
+    }
+
     const recognition = new SpeechRecognitionAPI();
     recognition.continuous = true;
     recognition.interimResults = true;
     recognition.lang = "en-US";
     recognitionRef.current = recognition;
+
+    recognition.onerror = (event: any) => {
+      // On mobile, "no-speech" and "network" errors are common — restart silently
+      if (event.error === "no-speech" || event.error === "audio-capture") return;
+      if (event.error === "network" || event.error === "service-not-allowed") {
+        try { recognition.start(); } catch {}
+      }
+    };
+
+    recognition.onend = () => {
+      // Auto-restart recognition if still recording (mobile may stop it unexpectedly)
+      if (mediaRecorderRef.current?.state === "recording") {
+        try { recognition.start(); } catch {}
+      }
+    };
 
     let segmentStart = 0;
 
@@ -92,6 +136,9 @@ export function Recorder({ folderId, onSaved, onCancel }: Props) {
   const stopRecording = useCallback(async () => {
     recognitionRef.current?.stop();
     mediaRecorderRef.current?.stop();
+    // Release mic immediately — no need to keep it open during processing
+    streamRef.current?.getTracks().forEach((t) => t.stop());
+    streamRef.current = null;
     setPhase("processing");
 
     // Give the MediaRecorder a moment to flush, then generate metadata
@@ -131,12 +178,13 @@ export function Recorder({ folderId, onSaved, onCancel }: Props) {
       duration,
     });
 
-    const blob = new Blob(audioChunksRef.current, { type: "audio/webm" });
+    const recordedType = mediaRecorderRef.current?.mimeType || "audio/webm";
+    const blob = new Blob(audioChunksRef.current, { type: recordedType });
     if (blob.size > 0) {
       const uploadUrl = await generateUploadUrl({});
       const res = await fetch(uploadUrl, {
         method: "POST",
-        headers: { "Content-Type": "audio/webm" },
+        headers: { "Content-Type": recordedType || "audio/webm" },
         body: blob,
       });
       const { storageId } = await res.json();

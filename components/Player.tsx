@@ -27,13 +27,13 @@ interface SilentRegion {
 interface Props {
   recordingId: Id<"recordings">;
   segments: Segment[];
+  initialDuration?: number;
 }
 
 const SPEEDS = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0];
 const SILENCE_THRESHOLD = 0.018;
-const MIN_SILENCE_DURATION = 0.6; // seconds of silence before it's worth skipping
+const MIN_SILENCE_DURATION = 0.6;
 
-// Split segments into per-word timings using linear interpolation
 function buildWordTimings(segments: Segment[]): WordTiming[] {
   return segments.flatMap((seg) => {
     const words = seg.text.trim().split(/\s+/).filter(Boolean);
@@ -47,7 +47,6 @@ function buildWordTimings(segments: Segment[]): WordTiming[] {
   });
 }
 
-// Decode audio buffer and return a list of silent time regions to skip
 async function detectSilentRegions(audioUrl: string): Promise<SilentRegion[]> {
   const response = await fetch(audioUrl);
   const arrayBuffer = await response.arrayBuffer();
@@ -61,9 +60,8 @@ async function detectSilentRegions(audioUrl: string): Promise<SilentRegion[]> {
 
   const data = audioBuffer.getChannelData(0);
   const sr = audioBuffer.sampleRate;
-  const windowSamples = Math.floor(sr * 0.08); // 80ms analysis window
+  const windowSamples = Math.floor(sr * 0.08);
   const regions: SilentRegion[] = [];
-
   let inSilence = false;
   let silenceStart = 0;
 
@@ -73,16 +71,13 @@ async function detectSilentRegions(audioUrl: string): Promise<SilentRegion[]> {
     for (let j = i; j < end; j++) sum += data[j] * data[j];
     const rms = Math.sqrt(sum / (end - i));
     const time = i / sr;
-
     if (rms < SILENCE_THRESHOLD) {
       if (!inSilence) { inSilence = true; silenceStart = time; }
     } else {
       if (inSilence) {
         const dur = time - silenceStart;
-        if (dur >= MIN_SILENCE_DURATION) {
-          // Leave 100ms buffer on each edge so we don't clip speech
+        if (dur >= MIN_SILENCE_DURATION)
           regions.push({ start: silenceStart + 0.1, end: time - 0.1 });
-        }
         inSilence = false;
       }
     }
@@ -90,89 +85,105 @@ async function detectSilentRegions(audioUrl: string): Promise<SilentRegion[]> {
   return regions;
 }
 
-export function Player({ recordingId, segments }: Props) {
+export function Player({ recordingId, segments, initialDuration = 0 }: Props) {
   const audioUrl = useQuery(api.recordings.getAudioUrl, { id: recordingId });
   const audioRef = useRef<HTMLAudioElement>(null);
 
   const [playing, setPlaying] = useState(false);
-  const [currentTime, setCurrentTime] = useState(0);
-  const [duration, setDuration] = useState(0);
+  const [duration, setDuration] = useState(initialDuration);
   const [speed, setSpeed] = useState(1.0);
   const [skipSilence, setSkipSilence] = useState(false);
   const [silentRegions, setSilentRegions] = useState<SilentRegion[]>([]);
   const [analyzing, setAnalyzing] = useState(false);
-  // volume: 0–3 (0%–300%). Above 1.0 requires a GainNode.
   const [volume, setVolume] = useState(1);
   const preMuteVolume = useRef(1);
-  const gainRef = useRef<GainNode | null>(null);
-  const audioCtxRef = useRef<AudioContext | null>(null);
 
+  // DOM refs for scrubber + time display — updated directly in RAF, no React re-render
+  const scrubberRef = useRef<HTMLInputElement>(null);
+  const timeDisplayRef = useRef<HTMLSpanElement>(null);
+  const durationRef = useRef(initialDuration); // mirror of duration state, readable inside RAF closure
+
+  // Word highlighting — React state, but only set when the index actually changes
+  const [activeWordIndex, setActiveWordIndex] = useState(-1);
   const activeWordRef = useRef<HTMLSpanElement>(null);
   const skipIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const rafRef = useRef<number | null>(null);
 
-  // Pre-compute per-word timings once
   const wordTimings = useMemo(() => buildWordTimings(segments), [segments]);
-
-  // Active word = last word whose startTime <= currentTime
-  const activeWordIndex = wordTimings.findLastIndex((w) => currentTime >= w.startTime);
+  // Keep a stable ref so RAF closure always sees current timings
+  const wordTimingsRef = useRef(wordTimings);
+  wordTimingsRef.current = wordTimings;
 
   useEffect(() => {
     activeWordRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
   }, [activeWordIndex]);
+
+  // RAF loop: scrubber + timer via direct DOM writes; word highlight via setState only on change
+  useEffect(() => {
+    if (!playing) {
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+      return;
+    }
+
+    let lastWordIdx = -1;
+
+    const tick = () => {
+      const audio = audioRef.current;
+      if (audio) {
+        const t = audio.currentTime;
+        const d = durationRef.current;
+
+        // Direct DOM — zero React overhead, true refresh-rate smoothness
+        if (scrubberRef.current) scrubberRef.current.value = String(t);
+        if (timeDisplayRef.current)
+          timeDisplayRef.current.textContent = `${formatDuration(t)} / ${formatDuration(d)}`;
+
+        // Only re-render when the highlighted word changes
+        const wt = wordTimingsRef.current;
+        let idx = -1;
+        for (let i = wt.length - 1; i >= 0; i--) {
+          if (t >= wt[i].startTime) { idx = i; break; }
+        }
+        if (idx !== lastWordIdx) {
+          lastWordIdx = idx;
+          setActiveWordIndex(idx);
+        }
+      }
+      rafRef.current = requestAnimationFrame(tick);
+    };
+
+    rafRef.current = requestAnimationFrame(tick);
+    return () => { if (rafRef.current) cancelAnimationFrame(rafRef.current); };
+  }, [playing]);
 
   // Wire audio element events
   useEffect(() => {
     const audio = audioRef.current;
     if (!audio || !audioUrl) return;
     audio.src = audioUrl;
-    const onTimeUpdate = () => setCurrentTime(audio.currentTime);
-    const onDurationChange = () => setDuration(audio.duration);
-    const onEnded = () => { setPlaying(false); };
-    audio.addEventListener("timeupdate", onTimeUpdate);
+    const onDurationChange = () => {
+      const d = audio.duration;
+      if (!isFinite(d) || isNaN(d)) return;
+      setDuration(d);
+      durationRef.current = d;
+      if (scrubberRef.current) scrubberRef.current.max = String(d);
+    };
+    const onEnded = () => setPlaying(false);
     audio.addEventListener("durationchange", onDurationChange);
     audio.addEventListener("ended", onEnded);
     return () => {
-      audio.removeEventListener("timeupdate", onTimeUpdate);
       audio.removeEventListener("durationchange", onDurationChange);
       audio.removeEventListener("ended", onEnded);
     };
   }, [audioUrl]);
 
-  // Apply speed
   useEffect(() => {
     if (audioRef.current) audioRef.current.playbackRate = speed;
   }, [speed]);
 
-  // Lazily create AudioContext + GainNode the first time we exceed 100%
-  const ensureGain = useCallback(async () => {
-    const audio = audioRef.current;
-    if (!audio || gainRef.current) return;
-    const ctx = new AudioContext();
-    const source = ctx.createMediaElementSource(audio);
-    const gain = ctx.createGain();
-    source.connect(gain);
-    gain.connect(ctx.destination);
-    gainRef.current = gain;
-    audioCtxRef.current = ctx;
-  }, []);
-
-  // Apply volume: use GainNode when one exists, audio.volume otherwise
   useEffect(() => {
-    if (gainRef.current) {
-      gainRef.current.gain.value = volume;
-    } else if (audioRef.current) {
-      audioRef.current.volume = Math.min(volume, 1);
-    }
+    if (audioRef.current) audioRef.current.volume = volume;
   }, [volume]);
-
-  const handleVolumeChange = useCallback(async (raw: number) => {
-    setVolume(raw);
-    if (raw > 1 && !gainRef.current) {
-      await ensureGain();
-      const gain = gainRef.current as GainNode | null;
-      if (gain) gain.gain.value = raw;
-    }
-  }, [ensureGain]);
 
   const toggleMute = () => {
     if (volume === 0) {
@@ -183,11 +194,10 @@ export function Player({ recordingId, segments }: Props) {
     }
   };
 
-  // Skip-silence: poll every 150ms and jump over detected silent regions
+  // Skip-silence: poll every 150ms
   useEffect(() => {
     if (skipIntervalRef.current) clearInterval(skipIntervalRef.current);
     if (!skipSilence || !playing || silentRegions.length === 0) return;
-
     skipIntervalRef.current = setInterval(() => {
       const audio = audioRef.current;
       if (!audio) return;
@@ -195,13 +205,9 @@ export function Player({ recordingId, segments }: Props) {
       const region = silentRegions.find((r) => t >= r.start && t < r.end);
       if (region) audio.currentTime = region.end;
     }, 150);
-
-    return () => {
-      if (skipIntervalRef.current) clearInterval(skipIntervalRef.current);
-    };
+    return () => { if (skipIntervalRef.current) clearInterval(skipIntervalRef.current); };
   }, [skipSilence, playing, silentRegions]);
 
-  // Analyze audio when skip-silence is first enabled
   const handleSkipSilence = useCallback(async () => {
     const next = !skipSilence;
     setSkipSilence(next);
@@ -219,9 +225,6 @@ export function Player({ recordingId, segments }: Props) {
   }, [skipSilence, audioUrl, silentRegions.length, analyzing]);
 
   const resumeAndPlay = useCallback(async () => {
-    if (audioCtxRef.current?.state === "suspended") {
-      await audioCtxRef.current.resume();
-    }
     await audioRef.current!.play();
     setPlaying(true);
   }, []);
@@ -240,14 +243,16 @@ export function Player({ recordingId, segments }: Props) {
   const seek = (e: React.ChangeEvent<HTMLInputElement>) => {
     const t = parseFloat(e.target.value);
     if (audioRef.current) audioRef.current.currentTime = t;
-    setCurrentTime(t);
+    // Keep time display in sync while scrubbing (RAF may be paused)
+    if (timeDisplayRef.current)
+      timeDisplayRef.current.textContent = `${formatDuration(t)} / ${formatDuration(durationRef.current)}`;
   };
 
   const clickWord = useCallback(async (startTime: number) => {
     const audio = audioRef.current;
     if (!audio) return;
     audio.currentTime = startTime;
-    setCurrentTime(startTime);
+    if (scrubberRef.current) scrubberRef.current.value = String(startTime);
     await resumeAndPlay();
   }, [resumeAndPlay]);
 
@@ -275,17 +280,19 @@ export function Player({ recordingId, segments }: Props) {
               : <Play className="h-3.5 w-3.5 pl-0.5" />
             }
           </button>
+          {/* Uncontrolled input — value driven by RAF via ref, not React state */}
           <input
+            ref={scrubberRef}
             type="range"
             min={0}
             max={duration || 100}
-            step={0.1}
-            value={currentTime}
+            step={0.01}
+            defaultValue={0}
             onChange={seek}
             className="flex-1 accent-stone-600"
           />
-          <span className="shrink-0 text-xs tabular-nums text-stone-400">
-            {formatDuration(currentTime)} / {formatDuration(duration)}
+          <span ref={timeDisplayRef} className="shrink-0 text-xs tabular-nums text-stone-400">
+            0:00 / {formatDuration(initialDuration)}
           </span>
         </div>
 
@@ -303,15 +310,12 @@ export function Player({ recordingId, segments }: Props) {
           <input
             type="range"
             min={0}
-            max={3}
-            step={0.05}
+            max={1}
+            step={0.02}
             value={volume}
-            onChange={(e) => handleVolumeChange(parseFloat(e.target.value))}
+            onChange={(e) => setVolume(parseFloat(e.target.value))}
             className="flex-1 accent-stone-600"
           />
-          <span className="shrink-0 w-9 text-right text-xs tabular-nums text-stone-400">
-            {Math.round(volume * 100)}%
-          </span>
         </div>
 
         {/* Speed + skip silence */}

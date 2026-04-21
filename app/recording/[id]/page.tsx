@@ -78,7 +78,7 @@ export default function RecordingPage({
             <p className="mb-3 text-xs font-medium uppercase tracking-widest text-stone-400">
               Playback
             </p>
-            <Player recordingId={recording._id} segments={recording.segments} />
+            <Player recordingId={recording._id} segments={recording.segments} initialDuration={recording.duration} />
           </section>
 
           {/* Full transcript */}
