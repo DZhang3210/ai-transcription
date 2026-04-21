@@ -5,6 +5,7 @@ export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
+
 export function formatDuration(seconds: number): string {
   if (!isFinite(seconds) || isNaN(seconds)) return "--:--";
   const m = Math.floor(seconds / 60);
