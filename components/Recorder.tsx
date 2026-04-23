@@ -4,7 +4,7 @@ import { useMutation, useAction } from "convex/react";
 import { api } from "@/convex/_generated/api";
 import { Id } from "@/convex/_generated/dataModel";
 import { useRef, useState, useCallback, useEffect } from "react";
-import { Mic, Square, Loader2 } from "lucide-react";
+import { Mic, Square, Loader2, AlertCircle } from "lucide-react";
 
 interface Segment {
   text: string;
@@ -18,9 +18,24 @@ interface Props {
   onCancel: () => void;
 }
 
+// Pick the best supported audio mimeType for this browser
+function getBestMimeType(): string {
+  if (typeof MediaRecorder === "undefined") return "";
+  const candidates = [
+    "audio/webm;codecs=opus",
+    "audio/webm",
+    "audio/mp4;codecs=aac",
+    "audio/mp4",
+    "audio/ogg;codecs=opus",
+  ];
+  return candidates.find((t) => MediaRecorder.isTypeSupported(t)) ?? "";
+}
+
 export function Recorder({ folderId, onSaved, onCancel }: Props) {
   const [phase, setPhase] = useState<"idle" | "recording" | "processing" | "saving">("idle");
+  const [startError, setStartError] = useState("");
   const [liveText, setLiveText] = useState("");
+  const [hasLiveTranscript, setHasLiveTranscript] = useState(true);
   const [segments, setSegments] = useState<Segment[]>([]);
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
@@ -32,10 +47,9 @@ export function Recorder({ folderId, onSaved, onCancel }: Props) {
   const audioChunksRef = useRef<Blob[]>([]);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const recognitionRef = useRef<any>(null);
-  // capture final segments inside the recognition closure
   const segmentsRef = useRef<Segment[]>([]);
 
-  // Stop mic on unmount (privacy: ensure no lingering microphone access)
+  // Stop mic on unmount — privacy guarantee
   useEffect(() => {
     return () => {
       recognitionRef.current?.stop();
@@ -49,13 +63,30 @@ export function Recorder({ folderId, onSaved, onCancel }: Props) {
   const generateMetadata = useAction(api.ai.generateMetadata);
 
   const startRecording = useCallback(async () => {
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        noiseSuppression: true,
-        echoCancellation: true,
-        autoGainControl: true,
-      },
-    });
+    setStartError("");
+
+    // ── 1. Microphone access ──────────────────────────────────────────────
+    let stream: MediaStream;
+    try {
+      // Try with noise-suppression hints first
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { noiseSuppression: true, echoCancellation: true, autoGainControl: true },
+      });
+    } catch {
+      try {
+        // Fall back to plain audio (some WKWebView versions reject constraints)
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.toLowerCase().includes("denied") || msg.toLowerCase().includes("permission")) {
+          setStartError("Microphone access was denied. Please allow microphone access in your browser settings.");
+        } else {
+          setStartError("Could not access your microphone. Please check browser permissions and try again.");
+        }
+        return;
+      }
+    }
+
     streamRef.current = stream;
     startTimeRef.current = Date.now();
     audioChunksRef.current = [];
@@ -63,51 +94,71 @@ export function Recorder({ folderId, onSaved, onCancel }: Props) {
     setSegments([]);
     setLiveText("");
 
-    // Use webm on desktop, fallback to supported format on mobile (e.g. iOS)
-    const mimeType = MediaRecorder.isTypeSupported("audio/webm")
-      ? "audio/webm"
-      : MediaRecorder.isTypeSupported("audio/mp4")
-      ? "audio/mp4"
-      : "";
-    const mr = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
-    mediaRecorderRef.current = mr;
-    mr.ondataavailable = (e) => audioChunksRef.current.push(e.data);
-    mr.start(100);
+    // ── 2. MediaRecorder ──────────────────────────────────────────────────
+    if (typeof MediaRecorder === "undefined") {
+      stream.getTracks().forEach((t) => t.stop());
+      streamRef.current = null;
+      setStartError("Audio recording is not supported in this browser. On iPhone, please use Safari instead of Chrome.");
+      return;
+    }
 
+    const mimeType = getBestMimeType();
+    try {
+      const mr = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+      mediaRecorderRef.current = mr;
+      mr.ondataavailable = (e) => { if (e.data.size > 0) audioChunksRef.current.push(e.data); };
+      mr.start(100);
+    } catch (err) {
+      stream.getTracks().forEach((t) => t.stop());
+      streamRef.current = null;
+      setStartError(`Could not start recording: ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
+
+    // ── 3. Speech recognition (best-effort, not required) ─────────────────
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const SpeechRecognitionAPI: any =
       (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
 
     if (!SpeechRecognitionAPI) {
-      // Speech recognition not available (e.g. some mobile browsers)
+      // Chrome on iOS / some Android browsers — recording still works, no live transcript
+      setHasLiveTranscript(false);
       setPhase("recording");
       return;
     }
 
-    const recognition = new SpeechRecognitionAPI();
-    recognition.continuous = true;
-    recognition.interimResults = true;
-    recognition.lang = "en-US";
-    recognitionRef.current = recognition;
+    setHasLiveTranscript(true);
+    let recognition: any; // eslint-disable-line @typescript-eslint/no-explicit-any
+    try {
+      recognition = new SpeechRecognitionAPI();
+      recognition.continuous = true;
+      recognition.interimResults = true;
+      recognition.lang = "en-US";
+      recognitionRef.current = recognition;
+    } catch {
+      setHasLiveTranscript(false);
+      setPhase("recording");
+      return;
+    }
 
-    recognition.onerror = (event: any) => {
-      // On mobile, "no-speech" and "network" errors are common — restart silently
+    recognition.onerror = (event: any) => { // eslint-disable-line @typescript-eslint/no-explicit-any
       if (event.error === "no-speech" || event.error === "audio-capture") return;
-      if (event.error === "network" || event.error === "service-not-allowed") {
-        try { recognition.start(); } catch {}
+      if (event.error === "not-allowed" || event.error === "service-not-allowed") {
+        setHasLiveTranscript(false);
+        return;
       }
+      // Transient errors — restart
+      try { recognition.start(); } catch {}
     };
 
     recognition.onend = () => {
-      // Auto-restart recognition if still recording (mobile may stop it unexpectedly)
       if (mediaRecorderRef.current?.state === "recording") {
         try { recognition.start(); } catch {}
       }
     };
 
     let segmentStart = 0;
-
-    recognition.onresult = (event: any) => {
+    recognition.onresult = (event: any) => { // eslint-disable-line @typescript-eslint/no-explicit-any
       const elapsed = () => (Date.now() - startTimeRef.current) / 1000;
       let interim = "";
       for (let i = event.resultIndex; i < event.results.length; i++) {
@@ -129,19 +180,17 @@ export function Recorder({ folderId, onSaved, onCancel }: Props) {
       }
     };
 
-    recognition.start();
+    try { recognition.start(); } catch {}
     setPhase("recording");
   }, []);
 
   const stopRecording = useCallback(async () => {
     recognitionRef.current?.stop();
     mediaRecorderRef.current?.stop();
-    // Release mic immediately — no need to keep it open during processing
     streamRef.current?.getTracks().forEach((t) => t.stop());
     streamRef.current = null;
     setPhase("processing");
 
-    // Give the MediaRecorder a moment to flush, then generate metadata
     await new Promise((r) => setTimeout(r, 300));
 
     const finalSegments = segmentsRef.current;
@@ -178,13 +227,13 @@ export function Recorder({ folderId, onSaved, onCancel }: Props) {
       duration,
     });
 
-    const recordedType = mediaRecorderRef.current?.mimeType || "audio/webm";
+    const recordedType = mediaRecorderRef.current?.mimeType || mimeType || "audio/webm";
     const blob = new Blob(audioChunksRef.current, { type: recordedType });
     if (blob.size > 0) {
       const uploadUrl = await generateUploadUrl({});
       const res = await fetch(uploadUrl, {
         method: "POST",
-        headers: { "Content-Type": recordedType || "audio/webm" },
+        headers: { "Content-Type": recordedType },
         body: blob,
       });
       const { storageId } = await res.json();
@@ -194,21 +243,40 @@ export function Recorder({ folderId, onSaved, onCancel }: Props) {
     onSaved(id);
   }, [title, description, folderId, createRecording, generateUploadUrl, saveAudio, onSaved]);
 
+  // Compute once so saveRecording closure can reference it
+  const mimeType = getBestMimeType();
   const fullText = [...segmentsRef.current.map((s) => s.text), liveText].filter(Boolean).join(" ");
 
   return (
     <div className="flex flex-col gap-5">
       {phase === "idle" && (
         <div className="flex flex-col items-center gap-5 py-6">
-          <div className="rounded-full bg-stone-100 p-5">
-            <Mic className="h-8 w-8 text-stone-400" />
-          </div>
-          <button
-            onClick={startRecording}
-            className="rounded-lg bg-stone-800 px-6 py-2.5 text-sm font-medium text-white transition hover:bg-stone-700 active:scale-95"
-          >
-            Start Recording
-          </button>
+          {startError ? (
+            <div className="flex w-full flex-col items-center gap-3">
+              <div className="flex items-start gap-2 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+                <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+                <span>{startError}</span>
+              </div>
+              <button
+                onClick={() => setStartError("")}
+                className="text-sm text-stone-400 hover:text-stone-600"
+              >
+                Try again
+              </button>
+            </div>
+          ) : (
+            <>
+              <div className="rounded-full bg-stone-100 p-5">
+                <Mic className="h-8 w-8 text-stone-400" />
+              </div>
+              <button
+                onClick={startRecording}
+                className="rounded-lg bg-stone-800 px-6 py-2.5 text-sm font-medium text-white transition hover:bg-stone-700 active:scale-95"
+              >
+                Start Recording
+              </button>
+            </>
+          )}
           <button onClick={onCancel} className="text-sm text-stone-400 hover:text-stone-600">
             Cancel
           </button>
@@ -232,9 +300,17 @@ export function Recorder({ folderId, onSaved, onCancel }: Props) {
           </div>
 
           <div className="min-h-[140px] rounded-lg border border-stone-200 bg-stone-50 p-4 text-sm leading-relaxed text-stone-700">
-            {segments.map((s) => s.text).join(" ")}
-            {liveText && <span className="text-stone-400"> {liveText}</span>}
-            {!fullText && <span className="text-stone-400">Speak — transcription will appear here…</span>}
+            {hasLiveTranscript ? (
+              <>
+                {segments.map((s) => s.text).join(" ")}
+                {liveText && <span className="text-stone-400"> {liveText}</span>}
+                {!fullText && <span className="text-stone-400">Speak — transcription will appear here…</span>}
+              </>
+            ) : (
+              <span className="text-stone-400">
+                Recording audio… (live transcription is not available in this browser)
+              </span>
+            )}
           </div>
 
           <div className="flex items-end justify-center gap-1 h-8">
