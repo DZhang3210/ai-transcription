@@ -48,6 +48,7 @@ export function Recorder({ folderId, onSaved, onCancel }: Props) {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const recognitionRef = useRef<any>(null);
   const segmentsRef = useRef<Segment[]>([]);
+  const transcriptBoxRef = useRef<HTMLDivElement>(null);
 
   // Stop mic on unmount — privacy guarantee
   useEffect(() => {
@@ -56,6 +57,12 @@ export function Recorder({ folderId, onSaved, onCancel }: Props) {
       streamRef.current?.getTracks().forEach((t) => t.stop());
     };
   }, []);
+
+  // Auto-scroll transcript box to bottom as text grows
+  useEffect(() => {
+    const el = transcriptBoxRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [segments, liveText]);
 
   const createRecording = useMutation(api.recordings.create);
   const generateUploadUrl = useMutation(api.recordings.generateUploadUrl);
@@ -299,7 +306,7 @@ export function Recorder({ folderId, onSaved, onCancel }: Props) {
             </button>
           </div>
 
-          <div className="min-h-[140px] rounded-lg border border-stone-200 bg-stone-50 p-4 text-sm leading-relaxed text-stone-700">
+          <div ref={transcriptBoxRef} className="min-h-[120px] max-h-[40vh] overflow-y-auto rounded-lg border border-stone-200 bg-stone-50 p-4 text-sm leading-relaxed text-stone-700">
             {hasLiveTranscript ? (
               <>
                 {segments.map((s) => s.text).join(" ")}
